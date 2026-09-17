@@ -7,9 +7,9 @@ on:
       - main
 
 env:
-  # NSS源码（6.12内核，全功能NSS支持）
+  # NSS源码（LibWrt，25.12分支，全功能NSS支持）
   REPO_URL: https://github.com/laipeng668/openwrt-6.x.git
-  REPO_BRANCH: main-nss
+  REPO_BRANCH: 25.12-nss
   CONFIG_FILE: configs/IPQ60XX.config
   GENERAL_CONFIG_FILE: configs/General.config
   DIY_SCRIPT: scripts/Roc-script.sh
