@@ -1,0 +1,160 @@
+name: 360V6 OpenWRT NSS Firmware Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  # NSS源码（6.12内核，全功能NSS支持）
+  REPO_URL: https://github.com/laipeng668/openwrt-6.x.git
+  REPO_BRANCH: main-nss
+  CONFIG_FILE: configs/IPQ60XX.config
+  GENERAL_CONFIG_FILE: configs/General.config
+  DIY_SCRIPT: scripts/Roc-script.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  Build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 600
+
+    steps:
+      - name: Checkout 仓库代码
+        uses: actions/checkout@v4
+
+      - name: 初始化编译环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install $(curl -fsSL ophub.org/ubuntu2404-make-openwrt-depends)
+          sudo -E systemctl daemon-reload
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: 克隆NSS源码
+        run: |
+          df -hT $GITHUB_WORKSPACE
+          sudo mkdir -p /mnt/openwrt
+          sudo chown -R $(id -u):$(id -g) /mnt/openwrt
+          git clone --depth 1 -b $REPO_BRANCH --single-branch $REPO_URL /mnt/openwrt
+          cd /mnt/openwrt
+          echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+          echo "=== 源码版本 ==="
+          git log -1 --oneline
+          echo ""
+          echo "=== 内核版本 ==="
+          grep -oP 'LINUX_KERNEL_HASH-\K[0-9]+\.[0-9]+\.[0-9]+' target/linux/generic/kernel-6.12 || echo "未找到6.12内核版本信息"
+          echo ""
+          echo "=== 确认360V6设备支持 ==="
+          find target/linux/qualcommax -name "*qihoo*360v6*" 2>/dev/null | head -10
+          find target/linux/qualcommax -name "*360v6*" 2>/dev/null | head -10
+
+      - name: 生成变量
+        run: |
+          cp $CONFIG_FILE $OPENWRT_PATH/.config
+          cd $OPENWRT_PATH
+          make defconfig > /dev/null 2>&1
+          SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
+          DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
+          echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
+          DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
+          echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+
+      - name: 缓存工具链
+        uses: actions/cache@v4
+        with:
+          key: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ github.sha }}
+          restore-keys: |
+            ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-
+          path: |
+            ${{ env.OPENWRT_PATH }}/.ccache
+            ${{ env.OPENWRT_PATH }}/staging_dir
+
+      - name: 刷新缓存时间戳
+        run: |
+          if [ -d "$OPENWRT_PATH/staging_dir" ]; then
+            find "$OPENWRT_PATH/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r dir; do
+                find "$dir" -type f -exec touch {} +
+            done
+          fi
+
+      - name: 安装Feeds
+        run: |
+          cd $OPENWRT_PATH
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 加载自定义配置（Roc-script.sh）
+        run: |
+          chmod +x $DIY_SCRIPT
+          cd $OPENWRT_PATH
+          $GITHUB_WORKSPACE/$DIY_SCRIPT
+
+      - name: 写入最终编译配置
+        run: |
+          cat $CONFIG_FILE $GENERAL_CONFIG_FILE > $OPENWRT_PATH/.config
+          cd $OPENWRT_PATH
+          make defconfig
+
+          echo "=== 目标设备 ==="
+          grep "CONFIG_TARGET_DEVICE" .config
+          echo ""
+          echo "=== ath11k内存profile ==="
+          grep "ATH11K_MEM_PROFILE" .config
+          echo ""
+          echo "=== 已选包数量 ==="
+          grep -c "^CONFIG_PACKAGE_.*=y" .config
+          echo ""
+          echo "=== 确认OpenClash已选 ==="
+          grep "openclash" .config || echo "[警告] OpenClash未在配置中找到"
+
+          make download -j$(nproc)
+
+      - name: 编译固件
+        id: compile
+        run: |
+          cd $OPENWRT_PATH
+          echo "=== 开始编译 ==="
+          echo "CPU核心数: $(nproc)"
+          make -j$(nproc) || make -j1 V=s
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: 检查磁盘空间
+        if: (!cancelled())
+        run: df -hT
+
+      - name: 整理固件文件
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd $OPENWRT_PATH/bin/targets/*/*
+          echo "=== 固件文件列表 ==="
+          ls -lh *.bin *.ubi 2>/dev/null || echo "未找到.bin/.ubi文件"
+          echo ""
+          echo "=== 360V6相关固件 ==="
+          find . -name "*qihoo*360v6*" -o -name "*360v6*" 2>/dev/null
+          echo ""
+          echo "=== 固件大小 ==="
+          du -sh .
+          echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+
+      - name: 上传固件到Artifact
+        if: steps.compile.outputs.status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 360V6-NSS-OpenClash-firmware
+          path: |
+            ${{ env.FIRMWARE_PATH }}/*.bin
+            ${{ env.FIRMWARE_PATH }}/*.ubi
+            ${{ env.FIRMWARE_PATH }}/*.manifest
+          retention-days: 30
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failed-log
+          path: ${{ env.OPENWRT_PATH }}/logs/
+          retention-days: 7
